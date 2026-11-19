@@ -31,7 +31,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -118,15 +118,14 @@ main{max-width:1100px;margin:0 auto;padding:16px 16px 96px;font-size:calc(16px*v
 
 /* Directory listing: a grid, so header and rows always share the same columns. */
 .listing{border:1px solid #30363d;border-radius:8px;overflow:hidden;font-size:.94em}
-.lhead,.row{display:grid;grid-template-columns:minmax(0,1fr) 7.5em 11em;column-gap:1em;align-items:center;
- padding:.5em .9em}
-.lhead{background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;font-size:.8em;
- text-transform:uppercase;letter-spacing:.03em}
-.lhead .c-size{justify-self:end}
-.lhead button{display:inline-flex;align-items:center;gap:.4em;padding:.25em 0;background:none;border:0;
- color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit}
+.lhead,.row{display:grid;grid-template-columns:minmax(0,1fr) 11ch 17ch;column-gap:1.5em;
+ align-items:center;padding:.5em .9em}
+.lhead{background:#161b22;border-bottom:1px solid #30363d;color:#8b949e}
+.lhead button{display:inline-flex;align-items:center;gap:0;padding:.25em 0;background:none;border:0;
+ color:inherit;font:inherit;font-size:.8em;text-transform:uppercase;letter-spacing:.03em}
 .lhead button:hover,.lhead [aria-sort="ascending"] button,.lhead [aria-sort="descending"] button{color:#e6edf3}
-.arrow{display:inline-block;width:1em;font-size:.8em}
+.arrow{display:inline-block;width:0;overflow:hidden;font-size:.8em}
+.lhead [aria-sort="ascending"] .arrow,.lhead [aria-sort="descending"] .arrow{width:1em;margin-left:.4em}
 [aria-sort="ascending"] .arrow::after{content:"\25B2"}
 [aria-sort="descending"] .arrow::after{content:"\25BC"}
 .row{border-bottom:1px solid #21262d}
@@ -136,17 +135,18 @@ main{max-width:1100px;margin:0 auto;padding:16px 16px 96px;font-size:calc(16px*v
 .row[data-dir="1"] .name{font-weight:600}
 .row[data-dir="1"] .name::after{content:"/"}
 .row.up .name::after{content:none}
-.row .size,.row .date{color:#8b949e;white-space:nowrap;font-variant-numeric:tabular-nums}
-.row .size{text-align:right}
+.row .size,.row .date{color:#8b949e;white-space:nowrap;font-variant-numeric:tabular-nums;text-align:left}
 .empty{color:#8b949e;text-align:center;padding:2em}
 @container (max-width:36em){
- .lhead{grid-template-columns:minmax(0,1fr) auto auto}
- .lhead .c-size{justify-self:auto}
- .row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name name" "size date";row-gap:.1em}
+ .lhead,.row{grid-template-columns:minmax(0,1fr) 17ch;grid-template-areas:"name name" "size date";
+  column-gap:1em;row-gap:.15em}
+ .lhead .c-name{grid-area:name}
+ .lhead .c-size{grid-area:size}
+ .lhead .c-date{grid-area:date}
  .row.up{grid-template-areas:"name name"}
  .row .name{grid-area:name}
- .row .size{grid-area:size;text-align:left;font-size:.85em}
- .row .date{grid-area:date;text-align:right;font-size:.85em}
+ .row .size{grid-area:size;font-size:.85em}
+ .row .date{grid-area:date;font-size:.85em}
 }
 
 .notice{padding:1.5em;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e}
@@ -161,6 +161,9 @@ pre{margin:0;padding:1em;overflow:auto;background:#161b22;border:1px solid #3036
  font:.85em/1.5 "Ubuntu Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4}
 pre code,pre code.hljs{display:inline;padding:0;overflow:visible;background:transparent}
 html.lr-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.lr-chunked{display:block}
+.lr-chunk{display:block;content-visibility:auto;contain-intrinsic-size:auto 4000px}
+html:not(.lr-wrap) .lr-chunked{width:var(--lr-code-width,auto)}
 
 .markdown{max-width:52em;margin:0 auto;line-height:1.65;overflow-wrap:break-word}
 .markdown :is(h1,h2,h3,h4,h5,h6){margin:1.5em 0 .75em;line-height:1.25;scroll-margin-top:16px}
@@ -180,18 +183,31 @@ html.lr-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere}
 
 .dock{position:fixed;right:16px;bottom:16px;display:flex;gap:8px;align-items:center;z-index:5}
 .dock button{border:0;background:none}
-.zoom{display:flex;background:#161b22;border:1px solid #30363d;border-radius:24px;overflow:hidden;
- box-shadow:0 4px 14px rgba(0,0,0,.45)}
-.zoom button{height:46px;min-width:42px;padding:0 10px;font-size:18px}
-.zoom button:hover{background:#21262d}
-#lr-zoom-reset{min-width:58px;font-size:12px;color:#8b949e}
-.dock .round,.dock .fab{display:flex;align-items:center;justify-content:center;border-radius:50%;
- box-shadow:0 4px 14px rgba(0,0,0,.45)}
-.dock .round{width:46px;height:46px;background:#161b22;border:1px solid #30363d;color:#e6edf3}
-.dock .round:hover{background:#21262d}
-.dock .round[aria-pressed="true"]{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
-.dock .fab{width:50px;height:50px;background:#1f6feb;color:#fff}
+.dock .fab{display:flex;align-items:center;justify-content:center;width:50px;height:50px;border-radius:50%;
+ background:#1f6feb;color:#fff;box-shadow:0 4px 14px rgba(0,0,0,.45)}
 .dock .fab:hover,.dock .fab[aria-expanded="true"]{background:#388bfd}
+
+.settings-panel{position:fixed;right:16px;bottom:80px;z-index:6;display:flex;flex-direction:column;
+ width:min(300px,calc(100vw - 32px));max-height:min(70vh,560px);background:#161b22;
+ border:1px solid #30363d;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.55)}
+.panel-head{display:flex;justify-content:space-between;align-items:center;padding:6px 8px 6px 14px;
+ border-bottom:1px solid #30363d}
+.panel-head button{width:34px;height:34px;font-size:22px;line-height:1;color:#8b949e;background:none;
+ border:0;border-radius:6px}
+.panel-head button:hover{background:#21262d;color:#e6edf3}
+.panel-body{overflow:auto}
+.control{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 14px;
+ border-bottom:1px solid #21262d}
+.control:last-child{border-bottom:0}
+.control-label{color:#8b949e;font-size:.875em}
+.zoom{display:flex;background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+.zoom button{height:36px;min-width:36px;padding:0 8px;font-size:16px}
+.zoom button:hover{background:#21262d}
+#lr-zoom-reset{min-width:54px;font-size:12px;color:#8b949e}
+.switch{min-width:64px;padding:5px 12px;border:1px solid #30363d;border-radius:6px;background:#0d1117;
+ color:#c9d1d9;font-size:.875em}
+.switch:hover{background:#21262d}
+.switch[aria-pressed="true"],.switch[aria-expanded="true"]{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
 
 .toc{position:fixed;right:16px;bottom:80px;z-index:5;display:flex;flex-direction:column;
  width:min(360px,calc(100vw - 32px));max-height:min(60vh,520px);background:#161b22;
@@ -210,6 +226,7 @@ html.lr-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere}
  main{padding:12px 12px 96px}
  body>header{padding:8px 12px}
  .dock{right:12px;bottom:12px}
+ .settings-panel{right:12px;bottom:76px;width:calc(100vw - 24px)}
  .toc{right:12px;bottom:76px;width:calc(100vw - 24px)}
 }
 """
@@ -296,33 +313,66 @@ PAGE_JS = r"""
 
   // Word wrap (per tab). The CSS reflows by itself when the window is resized.
   var wrapButton = document.getElementById("lr-wrap");
+  function showWrap(on) {
+    if (!wrapButton) return;
+    wrapButton.setAttribute("aria-pressed", on ? "true" : "false");
+    wrapButton.textContent = on ? "On" : "Off";
+  }
   function toggleWrap() {
     keepPosition(function () {
       var on = !root.classList.contains("lr-wrap");
       root.classList.toggle("lr-wrap", on);
       write("wrap", on ? "1" : "0");
-      if (wrapButton) wrapButton.setAttribute("aria-pressed", on ? "true" : "false");
+      showWrap(on);
     });
   }
   if (wrapButton) {
-    wrapButton.setAttribute("aria-pressed", root.classList.contains("lr-wrap") ? "true" : "false");
+    showWrap(root.classList.contains("lr-wrap"));
     wrapButton.addEventListener("click", toggleWrap);
   }
 
-  // Keyboard: + - 0 zoom, w or Alt+Z wrap, t contents box, Esc closes it.
+  // Settings panel. The controls live inside it so the reader stays uncluttered.
+  var settingsButton = document.getElementById("lr-settings");
+  var settingsPanel = document.getElementById("lr-settings-panel");
+  function closeSettings() {
+    if (!settingsPanel || settingsPanel.hidden) return;
+    settingsPanel.hidden = true;
+    settingsButton.setAttribute("aria-expanded", "false");
+  }
+  window.closeSettings = closeSettings;
+  function toggleSettings(open) {
+    if (!settingsButton || !settingsPanel) return;
+    if (open === undefined) open = settingsPanel.hidden;
+    if (open && window.toggleToc) window.toggleToc(false);
+    settingsPanel.hidden = !open;
+    settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  if (settingsButton && settingsPanel) {
+    settingsButton.addEventListener("click", function () { toggleSettings(); });
+    document.getElementById("lr-settings-close").addEventListener("click", closeSettings);
+    document.addEventListener("click", function (e) {
+      if (settingsPanel.hidden) return;
+      if (settingsPanel.contains(e.target) || settingsButton.contains(e.target)) return;
+      closeSettings();
+    });
+  }
+
+  // Keyboard: + - 0 zoom, w wrap, t contents box, p/r preview and raw.
+  var previewLink = document.getElementById("lr-view-preview");
+  var rawLink = document.getElementById("lr-view-raw");
+  function goToView(link) {
+    if (link && !link.classList.contains("on")) location.href = link.href;
+  }
   document.addEventListener("keydown", function (e) {
     if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName || "")) return;
-    if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === "KeyZ") {
-      if (wrapButton) { e.preventDefault(); toggleWrap(); }
-      return;
-    }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (label && (e.key === "+" || e.key === "=")) stepZoom(1);
     else if (label && (e.key === "-" || e.key === "_")) stepZoom(-1);
     else if (label && e.key === "0") applyZoom(1);
     else if (wrapButton && e.key === "w") toggleWrap();
     else if (window.toggleToc && e.key === "t") window.toggleToc();
-    else if (window.toggleToc && e.key === "Escape") window.toggleToc(false);
+    else if (previewLink && e.key === "p") goToView(previewLink);
+    else if (rawLink && e.key === "r") goToView(rawLink);
   });
 })();
 """
@@ -469,8 +519,120 @@ function workerMain() {
   function addNote(message) { notes.push(message); refreshNote(); }
   function setStatus(message) { status = message; refreshNote(); }
   function finish() { window.restoreScroll(); }
+
+  // Long code is split into blocks so the browser can skip layout for the parts
+  // far from the viewport. Without this, toggling wrap re-lays out every line.
+  var CHUNK_LINES = 200;
+  function countLines(text) {
+    var count = 0, at = -1;
+    while ((at = text.indexOf("\n", at + 1)) !== -1) count++;
+    return count;
+  }
+
+  function lineCut(text, wanted) {
+    var at = -1, found = 0;
+    while (found < wanted) {
+      at = text.indexOf("\n", at + 1);
+      if (at === -1) return -1;
+      found++;
+    }
+    return at + 1;
+  }
+
+  function chunkContent() {
+    var text = el.textContent;
+    if (text.length < 200000 && countLines(text) < 1500) return;
+    // Very long lines make each line expensive, so use smaller blocks there.
+    var average = text.length / (countLines(text) + 1);
+    CHUNK_LINES = average > 2000 ? 5 : average > 500 ? 20 : 200;
+    // Without wrapping, the code block needs an explicit width. Chunks use paint
+    // containment, so the browser otherwise forgets how far off-screen lines reach.
+    var widest = 0;
+    text.split("\n").forEach(function (line) {
+      var width = line.length + 3 * (line.split("\t").length - 1);
+      if (width > widest) widest = width;
+    });
+    el.style.setProperty("--lr-code-width", widest + "ch");
+    var nodes = Array.prototype.slice.call(el.childNodes);
+    var fragment = document.createDocumentFragment();
+    var chunk = null, used = 0;
+
+    function start() {
+      chunk = document.createElement("div");
+      chunk.className = "lr-chunk";
+      fragment.appendChild(chunk);
+      used = 0;
+    }
+    function add(node) {
+      if (!chunk) start();
+      chunk.appendChild(node);
+      used += countLines(node.textContent || "");
+      if (used >= CHUNK_LINES && (node.textContent || "").slice(-1) === "\n") chunk = null;
+    }
+    function addText(text) {
+      while (text) {
+        if (!chunk) start();
+        var cut;
+        if (used >= CHUNK_LINES) {
+          var next = text.indexOf("\n");
+          cut = next === -1 ? text.length : next + 1;
+        } else {
+          cut = lineCut(text, CHUNK_LINES - used);
+          if (cut === -1) cut = text.length;
+        }
+        var part = text.slice(0, cut);
+        chunk.appendChild(document.createTextNode(part));
+        used += countLines(part);
+        text = text.slice(cut);
+        if (used >= CHUNK_LINES && part.slice(-1) === "\n") chunk = null;
+      }
+    }
+
+    nodes.forEach(function (node) {
+      if (node.nodeType === 3) addText(node.nodeValue);
+      else add(node);
+    });
+    el.textContent = "";
+    el.appendChild(fragment);
+    el.classList.add("lr-chunked");
+  }
+
   function showText(text) {
+    el.classList.remove("lr-chunked");
     el.textContent = text;
+    chunkContent();
+    if (!shown) { shown = true; finish(); }
+  }
+
+  // Raw Markdown is still plain text, but heading lines are wrapped in spans so
+  // the contents box can jump to them. Headings inside code fences are ignored.
+  function renderRawMarkdown(text) {
+    var fragment = document.createDocumentFragment();
+    var buffer = "", fence = null;
+    text.split("\n").forEach(function (line, i, lines) {
+      var marker = /^\s*(`{3,}|~{3,})/.exec(line);
+      var heading = fence === null && /^ {0,3}(#{1,4})\s+(.+?)\s*#*\s*$/.exec(line);
+      if (heading) {
+        if (buffer) { fragment.appendChild(document.createTextNode(buffer)); buffer = ""; }
+        var span = document.createElement("span");
+        span.dataset.tocLevel = heading[1].length;
+        span.dataset.tocTitle = heading[2].trim();
+        span.textContent = line;
+        fragment.appendChild(span);
+      } else {
+        buffer += line;
+      }
+      if (marker) {
+        var character = marker[1][0];
+        fence = fence === character ? null : (fence === null ? character : fence);
+      }
+      if (i < lines.length - 1) buffer += "\n";
+    });
+    if (buffer) fragment.appendChild(document.createTextNode(buffer));
+    el.textContent = "";
+    el.appendChild(fragment);
+    chunkContent();
+    buildToc();
     if (!shown) { shown = true; finish(); }
   }
 
@@ -541,6 +703,7 @@ function workerMain() {
       } else if (m.type === "highlighted") {
         el.innerHTML = m.html;
         el.className = "hljs language-" + job.lang;
+        chunkContent();
       } else if (m.type === "skipped") {
         addNote(m.reason === "large"
           ? "Syntax highlighting skipped (large file)."
@@ -577,8 +740,10 @@ function workerMain() {
   function toggleToc(open) {
     if (!tocButton || tocButton.hidden) return;
     if (open === undefined) open = toc.hidden;
+    if (open && window.closeSettings) window.closeSettings();
     toc.hidden = !open;
     tocButton.setAttribute("aria-expanded", open ? "true" : "false");
+    tocButton.textContent = open ? "Close" : "Open";
     if (open) markCurrent();
   }
 
@@ -596,27 +761,36 @@ function workerMain() {
     active.scrollIntoView({ block: "nearest" });
   }
 
+  function headingLevel(element) {
+    return element.dataset.tocLevel ? +element.dataset.tocLevel : +element.tagName[1];
+  }
+
   function buildToc() {
     if (!tocButton) return;
-    var found = el.querySelectorAll("h1,h2,h3,h4");
+    var found = el.querySelectorAll("h1,h2,h3,h4,[data-toc-level]");
     if (found.length < 2) return;
     var base = 6, counts = {}, fragment = document.createDocumentFragment();
-    found.forEach(function (h) { base = Math.min(base, +h.tagName[1]); });
+    headings = [];
+    tocList.textContent = "";
+    found.forEach(function (h) { base = Math.min(base, headingLevel(h)); });
     found.forEach(function (h, i) {
-      var slug = h.textContent.trim().toLowerCase()
+      var title = (h.dataset.tocTitle || h.textContent).trim();
+      var slug = title.toLowerCase()
         .replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s/g, "-") || "section";
       var n = counts[slug] === undefined ? 0 : counts[slug] + 1;
       counts[slug] = n;
       h.id = n ? slug + "-" + n : slug;
       var link = document.createElement("a");
       link.href = "#" + h.id;
-      link.textContent = h.textContent.trim();
+      link.textContent = title;
       link.dataset.i = i;
-      link.style.paddingLeft = (10 + (+h.tagName[1] - base) * 14) + "px";
+      link.style.paddingLeft = (10 + (headingLevel(h) - base) * 14) + "px";
       fragment.appendChild(link);
       headings.push({ el: h, id: h.id, link: link });
     });
     tocList.appendChild(fragment);
+    var control = document.getElementById("lr-contents-control");
+    if (control) control.hidden = false;
     tocButton.hidden = false;
   }
 
@@ -629,7 +803,7 @@ function workerMain() {
       if (!link) return;
       e.preventDefault();
       var heading = headings[+link.dataset.i];
-      heading.el.scrollIntoView();
+      heading.el.scrollIntoView({ block: "start", inline: "nearest" });
       history.replaceState(null, "", "#" + heading.id);
       markCurrent(heading);
     });
@@ -682,7 +856,10 @@ function workerMain() {
       var response = await fetch(CFG.rawUrl);
       if (!response.ok) throw new Error(response.status + " " + response.statusText);
       text = await response.text();
-      if (CFG.mode === "raw") showText(text);
+      if (CFG.mode === "raw") {
+        if (CFG.kind === "markdown") renderRawMarkdown(text);
+        else showText(text);
+      }
       else if (CFG.kind === "markdown") await renderMarkdown(text);
       else renderCode(text);
     } catch (e) {
@@ -711,36 +888,59 @@ def page(title, body, dock="", script=""):
     )
 
 
-def dock_html(with_wrap=False, with_contents=False):
-    """Floating controls: zoom, optional word wrap, optional contents button and box."""
-    wrap = contents = panel = ""
+def dock_html(with_wrap=False, with_contents=False, view=""):
+    """Floating settings button and the controls it opens."""
+    controls = [
+        '<div class="control"><span class="control-label">Zoom</span>'
+        '<div class="zoom">'
+        '<button id="lr-zoom-out" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>'
+        '<button id="lr-zoom-reset" aria-label="Reset zoom" title="Reset zoom (0)">100%</button>'
+        '<button id="lr-zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button></div></div>'
+    ]
     if with_wrap:
-        wrap = (
-            '<button id="lr-wrap" class="round" aria-label="Toggle word wrap" '
-            'title="Toggle word wrap (w or Alt+Z)" aria-pressed="true">'
-            '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" '
-            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-            '<path d="M3 6h18M3 12h14a3 3 0 0 1 0 6h-5M3 18h5"/><path d="m14 15-2 3 2 3"/></svg></button>'
+        controls.append(
+            '<div class="control"><span class="control-label">Word wrap</span>'
+            '<button id="lr-wrap" class="switch" type="button" aria-label="Toggle word wrap" '
+            'title="Toggle word wrap (w)" aria-pressed="true">On</button></div>'
         )
+    contents = ""
     if with_contents:
-        contents = (
-            '<button id="lr-toc-button" class="fab" aria-label="Contents" title="Contents (t)" '
-            'aria-expanded="false" aria-controls="lr-toc" hidden>'
-            '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" '
-            'stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>'
+        controls.append(
+            '<div class="control" id="lr-contents-control" hidden>'
+            '<span class="control-label">Contents</span>'
+            '<button id="lr-toc-button" class="switch" type="button" '
+            'title="t / open or close the contents box" aria-expanded="false" '
+            'aria-controls="lr-toc" hidden>Open</button></div>'
         )
-        panel = (
+        contents = (
             '<nav id="lr-toc" class="toc" aria-label="Contents" hidden>'
             '<div class="toc-head"><strong>Contents</strong>'
             '<button id="lr-toc-close" aria-label="Close contents">&times;</button></div>'
             '<div id="lr-toc-list" class="toc-list"></div></nav>'
         )
+    if view:
+        controls.append(view)
+    gear = (
+        '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" '
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        '<circle cx="12" cy="12" r="3"/>'
+        '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06'
+        'a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09'
+        'a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06'
+        'a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09'
+        'a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06'
+        'a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09'
+        'a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06'
+        'a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09'
+        'a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+    )
     return (
-        '<div class="dock"><div class="zoom">'
-        '<button id="lr-zoom-out" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>'
-        '<button id="lr-zoom-reset" aria-label="Reset zoom" title="Reset zoom (0)">100%</button>'
-        '<button id="lr-zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button></div>'
-        f"{wrap}{contents}</div>{panel}"
+        '<div class="dock"><button id="lr-settings" class="fab" aria-label="Settings" '
+        f'title="Settings" aria-expanded="false" aria-controls="lr-settings-panel">{gear}</button></div>'
+        '<div id="lr-settings-panel" class="settings-panel" role="dialog" aria-label="Settings" hidden>'
+        '<div class="panel-head"><strong>Settings</strong>'
+        '<button id="lr-settings-close" aria-label="Close settings">&times;</button></div>'
+        f'<div class="panel-body">{"".join(controls)}</div></div>{contents}'
     )
 
 
@@ -773,15 +973,17 @@ def breadcrumbs(root_name, url_path):
     return '<span class="sep">/</span>'.join(crumbs)
 
 
-def view_toggle(url_path, raw_mode, force):
-    """Preview / Raw switch shown in the header of text files."""
+def view_control(url_path, raw_mode, force):
+    """Preview / Raw switch shown inside the settings panel."""
     current = ' class="on" aria-current="page"'
     preview_url = url_path + ("?force=1" if force else "")
     raw_url = url_path + "?view=raw" + ("&force=1" if force else "")
     return (
-        '<div class="seg">'
-        f'<a href="{html.escape(preview_url)}"{"" if raw_mode else current}>Preview</a>'
-        f'<a href="{html.escape(raw_url)}"{current if raw_mode else ""}>Raw</a></div>'
+        '<div class="control"><span class="control-label">View</span><div class="seg">'
+        f'<a id="lr-view-preview" href="{html.escape(preview_url)}" title="Preview (p)"'
+        f'{"" if raw_mode else current}>Preview</a>'
+        f'<a id="lr-view-raw" href="{html.escape(raw_url)}" title="Raw (r)"'
+        f'{current if raw_mode else ""}>Raw</a></div></div>'
     )
 
 
@@ -1198,7 +1400,7 @@ class Handler(BaseHTTPRequestHandler):
         name = os.path.basename(path)
         raw_url = url.path + "?raw=1"
         raw_mode = mode == "raw"
-        toggle = ""
+        view = ""
         dock = ""
         script = ""
 
@@ -1214,7 +1416,7 @@ class Handler(BaseHTTPRequestHandler):
                        f'<a href="{html.escape(raw_url)}">open the raw file</a>.</div>')
         else:
             if kind != "code" or language:  # plain text looks the same in both views
-                toggle = view_toggle(url.path, raw_mode, force)
+                view = view_control(url.path, raw_mode, force)
             config = json.dumps({
                 "kind": kind, "lang": language, "mode": mode, "rawUrl": raw_url,
                 "minHint": ".min." in name.lower(),
@@ -1226,12 +1428,13 @@ class Handler(BaseHTTPRequestHandler):
                 target = '<pre><code id="lr-content"></code></pre>'
             content = ('<div id="lr-note" class="note" hidden><span id="lr-note-text"></span>'
                        f'<span id="lr-note-actions"></span></div>{target}')
-            dock = dock_html(with_wrap=True, with_contents=kind == "markdown" and not raw_mode)
+            dock = dock_html(with_wrap=not (kind == "markdown" and not raw_mode),
+                             with_contents=kind == "markdown", view=view)
             script = f"const CFG={config};{PREVIEW_JS}"
 
         body = (
             f'<header><nav class="crumbs">{breadcrumbs(self.server.root_name, url.path)}</nav>'
-            f'<div class="meta"><span>{human_size(size)}</span>{toggle}</div></header>'
+            f'<div class="meta"><span>{human_size(size)}</span></div></header>'
             f"<main>{content}</main>"
         )
         self.send_text(200, page(name, body, dock, script))
