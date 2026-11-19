@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""live-server: a small static file server with a directory listing,
-dark file previews and automatic browser reload.
- 
+"""livereader: read files in your browser, with automatic reload.
+
+Serves a directory with a clean dark file browser and readable previews for
+Markdown, JSON, source code, plain text and images. The page reloads by itself
+when files change.
+
 Python standard library only. Linux only (auto-reload uses inotify).
- 
+
 Usage:
-    live-server                 serve the current directory
-    live-server /path/to/dir    serve a specific directory
+    livereader                 serve the current directory
+    livereader /path/to/dir    serve a specific directory
 """
- 
+
 import argparse
 import codecs
 import ctypes
@@ -27,36 +30,54 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
- 
+
+__version__ = "1.1.0"
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
- 
+
 HOST = "127.0.0.1"                  # localhost only: files are never exposed to the network
 PORT_RANGE = (40000, 50000)         # rarely used by other software
 PORT_ATTEMPTS = 50
-PREVIEW_LIMIT = 1024 * 1024         # larger text files are not previewed (raw link only)
-HIGHLIGHT_LIMIT = 200 * 1024        # larger text files are shown without highlighting
-INJECT_LIMIT = 20 * 1024 * 1024     # larger HTML files are served without reload script
+
+# Size limits protect RAM and CPU on small machines. The browser must hold the
+# whole file as text, so these are limits on what is rendered, not on what is served.
+PREVIEW_LIMIT = 10 * 1024 * 1024    # larger text files ask for confirmation ("Render anyway")
+FORMAT_LIMIT = 8 * 1024 * 1024      # larger minified JS / JSON is shown as-is, not reformatted
+HIGHLIGHT_LIMIT = 3 * 1024 * 1024   # larger text is not highlighted unless you click "Highlight anyway"
+INJECT_LIMIT = 20 * 1024 * 1024     # larger HTML files are served without the reload script
+
+# Folder sizes in the directory listing (computed on demand, never in the background).
+FOLDER_SIZE_LIMIT = 250_000         # stop counting after this many entries in one folder
+FOLDER_SIZE_SECONDS = 8             # ...or after this long, and show "≥ size"
+SIZE_CACHE_SECONDS = 30
+
 SNIFF_BYTES = 8192
 CHUNK_SIZE = 64 * 1024
 DEBOUNCE_SECONDS = 0.15
 HEARTBEAT_SECONDS = 15
 EVENTS_PATH = "/__events"
+SIZE_PATH = "/__size"
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache"}
- 
-# Browser libraries for previews (pinned versions, cached by the browser).
-HLJS_CSS = "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css"
-HLJS_JS = "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"
-MARKED_JS = "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
-PURIFY_JS = "https://cdn.jsdelivr.net/npm/dompurify@3.1.2/dist/purify.min.js"
-BEAUTIFY_JS = "https://cdn.jsdelivr.net/npm/js-beautify@1.15.1/js/lib/beautify.js"
- 
+
+# Browser libraries, pinned and loaded on demand (only when a file needs them).
+LIBS = {
+    "hljsCss": "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css",
+    "hljs": "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js",
+    "marked": "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js",
+    "purify": "https://cdn.jsdelivr.net/npm/dompurify@3.1.2/dist/purify.min.js",
+    "beautify": "https://cdn.jsdelivr.net/npm/js-beautify@1.15.1/js/lib/beautify.js",
+}
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif"}
- 
+JSON_EXTENSIONS = {".json", ".map", ".geojson", ".webmanifest"}  # .map = source maps
+TEXT_KINDS = {"markdown", "json", "code"}
+
 LANGUAGES = {
     ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
-    ".ts": "typescript", ".tsx": "typescript",
+    ".es6": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".mts": "typescript", ".cts": "typescript",
     ".py": "python", ".rb": "ruby", ".php": "php", ".pl": "perl", ".lua": "lua",
     ".sh": "bash", ".bash": "bash", ".zsh": "bash",
     ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cs": "csharp",
@@ -67,149 +88,703 @@ LANGUAGES = {
     ".sql": "sql", ".diff": "diff", ".patch": "diff",
 }
 FILENAME_LANGUAGES = {"makefile": "makefile", "dockerfile": "dockerfile"}
- 
+
 # --------------------------------------------------------------------------
-# Page templates
+# Page assets
 # --------------------------------------------------------------------------
- 
-CSS = """
+
+CSS = r"""
+:root{color-scheme:dark}
+[hidden]{display:none!important}
 *{box-sizing:border-box}
-body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,"Segoe UI",Ubuntu,Roboto,sans-serif}
-a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
-header{display:flex;flex-wrap:wrap;gap:8px 16px;justify-content:space-between;align-items:center;
- padding:12px 16px;background:#161b22;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:1}
-.crumbs{font-weight:600;word-break:break-all}
+body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,"Segoe UI",Ubuntu,Roboto,sans-serif;
+ -webkit-text-size-adjust:100%}
+a{color:#58a6ff;text-decoration:none}
+a:hover{text-decoration:underline}
+button{font:inherit;color:inherit;cursor:pointer}
+
+body>header{display:flex;flex-wrap:wrap;gap:8px 16px;justify-content:space-between;align-items:center;
+ padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d}
+.crumbs{font-weight:600;overflow-wrap:anywhere}
 .sep{color:#6e7681;margin:0 6px}
-.meta{color:#8b949e;display:flex;gap:12px;align-items:center}
-main{max-width:1100px;margin:0 auto;padding:16px}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;color:#8b949e;font-weight:500;font-size:12px;text-transform:uppercase}
-th,td{padding:8px 12px;border-bottom:1px solid #21262d}
-tbody tr:hover{background:#161b22}
-td.name{width:100%;word-break:break-all}
-.dir a{font-weight:600}
-.dir a:not([href="../"])::after{content:"/"}
-.size,.date{color:#8b949e;white-space:nowrap}
-.size{text-align:right}
-.empty{color:#8b949e;text-align:center;padding:32px}
-.notice{padding:24px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e}
-.notice h1{margin:0 0 8px;color:#e6edf3;font-size:20px}
-.note{color:#d29922;margin-bottom:8px}
-.note:empty{display:none}
-.image{text-align:center;padding:16px;background:#161b22;border:1px solid #30363d;border-radius:6px}
+.meta{display:flex;gap:12px;align-items:center;color:#8b949e}
+.seg{display:inline-flex;border:1px solid #30363d;border-radius:6px;overflow:hidden}
+.seg a{padding:3px 14px;color:#8b949e}
+.seg a:hover{color:#e6edf3;text-decoration:none}
+.seg a.on{background:#30363d;color:#e6edf3}
+
+main{max-width:1100px;margin:0 auto;padding:16px 16px 96px;font-size:calc(16px*var(--zoom,1));
+ container-type:inline-size}
+
+/* Directory listing: a grid, so header and rows always share the same columns. */
+.listing{border:1px solid #30363d;border-radius:8px;overflow:hidden;font-size:.94em}
+.lhead,.row{display:grid;grid-template-columns:minmax(0,1fr) 7.5em 11em;column-gap:1em;align-items:center;
+ padding:.5em .9em}
+.lhead{background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;font-size:.8em;
+ text-transform:uppercase;letter-spacing:.03em}
+.lhead .c-size{justify-self:end}
+.lhead button{display:inline-flex;align-items:center;gap:.4em;padding:.25em 0;background:none;border:0;
+ color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit}
+.lhead button:hover,.lhead [aria-sort="ascending"] button,.lhead [aria-sort="descending"] button{color:#e6edf3}
+.arrow{display:inline-block;width:1em;font-size:.8em}
+[aria-sort="ascending"] .arrow::after{content:"\25B2"}
+[aria-sort="descending"] .arrow::after{content:"\25BC"}
+.row{border-bottom:1px solid #21262d}
+.row:last-child{border-bottom:0}
+.row:hover{background:#161b22}
+.row .name{min-width:0;overflow-wrap:anywhere}
+.row[data-dir="1"] .name{font-weight:600}
+.row[data-dir="1"] .name::after{content:"/"}
+.row.up .name::after{content:none}
+.row .size,.row .date{color:#8b949e;white-space:nowrap;font-variant-numeric:tabular-nums}
+.row .size{text-align:right}
+.empty{color:#8b949e;text-align:center;padding:2em}
+@container (max-width:36em){
+ .lhead{grid-template-columns:minmax(0,1fr) auto auto}
+ .lhead .c-size{justify-self:auto}
+ .row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name name" "size date";row-gap:.1em}
+ .row.up{grid-template-areas:"name name"}
+ .row .name{grid-area:name}
+ .row .size{grid-area:size;text-align:left;font-size:.85em}
+ .row .date{grid-area:date;text-align:right;font-size:.85em}
+}
+
+.notice{padding:1.5em;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e}
+.notice h1{margin:0 0 .4em;color:#e6edf3;font-size:1.3em}
+.note{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:#d29922;margin-bottom:.6em;font-size:.875em}
+.linkbtn{padding:2px 12px;background:none;border:1px solid #30363d;border-radius:6px;color:#58a6ff}
+.linkbtn:hover{background:#21262d}
+.image{text-align:center;padding:1em;background:#161b22;border:1px solid #30363d;border-radius:6px}
 .image img{max-width:100%;height:auto}
-pre{margin:0;padding:16px;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:6px;
- font:13px/1.45 "Ubuntu Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4}
-pre code,pre code.hljs{padding:0;background:transparent}
-.markdown{line-height:1.6;word-wrap:break-word}
-.markdown h1,.markdown h2,.markdown h3,.markdown h4{margin:24px 0 16px;line-height:1.25}
-.markdown h1,.markdown h2{padding-bottom:.3em;border-bottom:1px solid #30363d}
-.markdown code{padding:.2em .4em;background:rgba(110,118,129,.4);border-radius:6px;font-size:85%;
+
+pre{margin:0;padding:1em;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:6px;
+ font:.85em/1.5 "Ubuntu Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4}
+pre code,pre code.hljs{display:inline;padding:0;overflow:visible;background:transparent}
+html.lr-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere}
+
+.markdown{max-width:52em;margin:0 auto;line-height:1.65;overflow-wrap:break-word}
+.markdown :is(h1,h2,h3,h4,h5,h6){margin:1.5em 0 .75em;line-height:1.25;scroll-margin-top:16px}
+.markdown :is(h1,h2){padding-bottom:.3em;border-bottom:1px solid #30363d}
+.markdown>:first-child{margin-top:0}
+.markdown p,.markdown ul,.markdown ol{margin:0 0 1em}
+.markdown code{padding:.2em .4em;background:rgba(110,118,129,.4);border-radius:6px;font-size:.85em;
  font-family:"Ubuntu Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.markdown pre{margin:16px 0}
-.markdown pre code{padding:0;background:none;font:inherit}
-.markdown blockquote{margin:0;padding:0 1em;color:#8b949e;border-left:.25em solid #30363d}
-.markdown table{width:auto;display:block;overflow:auto}
-.markdown th,.markdown td{border:1px solid #30363d;padding:6px 13px}
-.markdown th{text-transform:none;font-size:inherit;color:inherit;font-weight:600}
+.markdown pre{margin:0 0 1em}
+.markdown pre code{padding:0;background:none;font-size:1em}
+.markdown blockquote{margin:0 0 1em;padding:0 1em;color:#8b949e;border-left:.25em solid #30363d}
+.markdown table{display:block;overflow:auto;border-collapse:collapse;margin:0 0 1em}
+.markdown th,.markdown td{border:1px solid #30363d;padding:.4em .8em}
+.markdown th{font-weight:600}
 .markdown img{max-width:100%}
-.markdown hr{border:0;border-top:1px solid #30363d}
-@media(max-width:600px){.date{display:none}main{padding:8px}}
+.markdown hr{border:0;border-top:1px solid #30363d;margin:1.5em 0}
+
+.dock{position:fixed;right:16px;bottom:16px;display:flex;gap:8px;align-items:center;z-index:5}
+.dock button{border:0;background:none}
+.zoom{display:flex;background:#161b22;border:1px solid #30363d;border-radius:24px;overflow:hidden;
+ box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.zoom button{height:46px;min-width:42px;padding:0 10px;font-size:18px}
+.zoom button:hover{background:#21262d}
+#lr-zoom-reset{min-width:58px;font-size:12px;color:#8b949e}
+.dock .round,.dock .fab{display:flex;align-items:center;justify-content:center;border-radius:50%;
+ box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.dock .round{width:46px;height:46px;background:#161b22;border:1px solid #30363d;color:#e6edf3}
+.dock .round:hover{background:#21262d}
+.dock .round[aria-pressed="true"]{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
+.dock .fab{width:50px;height:50px;background:#1f6feb;color:#fff}
+.dock .fab:hover,.dock .fab[aria-expanded="true"]{background:#388bfd}
+
+.toc{position:fixed;right:16px;bottom:80px;z-index:5;display:flex;flex-direction:column;
+ width:min(360px,calc(100vw - 32px));max-height:min(60vh,520px);background:#161b22;
+ border:1px solid #30363d;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.55)}
+.toc-head{display:flex;justify-content:space-between;align-items:center;padding:6px 8px 6px 14px;
+ border-bottom:1px solid #30363d}
+.toc-head button{width:34px;height:34px;font-size:22px;line-height:1;color:#8b949e;background:none;
+ border:0;border-radius:6px}
+.toc-head button:hover{background:#21262d;color:#e6edf3}
+.toc-list{overflow:auto;padding:6px}
+.toc-list a{display:block;padding:7px 10px;border-radius:6px;color:#c9d1d9;line-height:1.35;overflow-wrap:anywhere}
+.toc-list a:hover{background:#21262d;text-decoration:none}
+.toc-list a.on{background:#1f6feb33;color:#58a6ff}
+
+@media(max-width:600px){
+ main{padding:12px 12px 96px}
+ body>header{padding:8px 12px}
+ .dock{right:12px;bottom:12px}
+ .toc{right:12px;bottom:76px;width:calc(100vw - 24px)}
+}
 """
- 
-# Reconnects after a server restart; reloads only when the version changed.
-RELOAD_SCRIPT = (
+
+# Runs in <head> so the saved zoom and word-wrap state apply before the first paint.
+PAGE_INIT_JS = (
+    'try{var r=document.documentElement,z=parseFloat(sessionStorage.getItem("zoom"));'
+    'if(z>0)r.style.setProperty("--zoom",z);'
+    'if(sessionStorage.getItem("wrap")!=="0")r.classList.add("lr-wrap")}'
+    'catch(e){r.classList.add("lr-wrap")}'
+)
+
+# Added to the user's own HTML pages (kept minimal, touches no storage).
+INJECTED_RELOAD_SCRIPT = (
     '<script>(function(){var v=null,es=new EventSource("%s");'
     "es.onmessage=function(e){if(v!==null&&e.data!==v)location.reload();v=e.data;};})();</script>"
     % EVENTS_PATH
 )
- 
-# Runs in the browser: fetches the raw file and renders it.
-PREVIEW_JS = """
-(async function () {
-  var el = document.getElementById("content");
-  var note = document.getElementById("note");
-  var text = "";
-  try {
-    var res = await fetch(CFG.rawUrl);
-    if (!res.ok) throw new Error(res.status + " " + res.statusText);
-    text = await res.text();
-    if (CFG.kind === "markdown") {
-      el.innerHTML = DOMPurify.sanitize(marked.parse(text));
-      el.querySelectorAll("pre code").forEach(function (block) {
-        var m = /language-(\\S+)/.exec(block.className);
-        if (m && hljs.getLanguage(m[1])) hljs.highlightElement(block);
-      });
+
+# Shared by every page the server renders: live reload, scroll memory, zoom, word wrap.
+# Zoom, wrap and scroll position live in sessionStorage, which is private to each tab.
+PAGE_JS = r"""
+(function () {
+  var root = document.documentElement;
+  var scrollKey = "lr-scroll:" + location.pathname + location.search;
+  var STEPS = [0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+
+  function read(key) { try { return sessionStorage.getItem(key); } catch (e) { return null; } }
+  function write(key, value) { try { sessionStorage.setItem(key, value); } catch (e) {} }
+  function forget(key) { try { sessionStorage.removeItem(key); } catch (e) {} }
+
+  // Live reload. The scroll position is kept across the reload.
+  var version = null;
+  var events = new EventSource("/__events");
+  events.onmessage = function (e) {
+    if (version !== null && e.data !== version) {
+      write(scrollKey, window.scrollY);
+      location.reload();
+    }
+    version = e.data;
+  };
+
+  window.restoreScroll = function () {
+    var saved = read(scrollKey);
+    if (saved !== null) { forget(scrollKey); window.scrollTo(0, +saved); return; }
+    if (location.hash.length > 1) {
+      try {
+        var target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+        if (target) target.scrollIntoView();
+      } catch (e) {}
+    }
+  };
+  if (!document.getElementById("lr-content")) window.restoreScroll();
+
+  // Layout changes (zoom, wrap) keep the reading position by scaling the scroll offset.
+  function keepPosition(change) {
+    var height = root.scrollHeight, top = window.scrollY;
+    change();
+    window.scrollTo(0, top * root.scrollHeight / height);
+  }
+
+  // Zoom (per tab).
+  var label = document.getElementById("lr-zoom-reset");
+  function currentZoom() { var z = parseFloat(read("zoom")); return z > 0 ? z : 1; }
+  function showZoom(z) { if (label) label.textContent = Math.round(z * 100) + "%"; }
+  function applyZoom(z) {
+    keepPosition(function () {
+      write("zoom", z);
+      root.style.setProperty("--zoom", z);
+      showZoom(z);
+    });
+  }
+  function stepZoom(direction) {
+    var z = currentZoom(), index = 0;
+    STEPS.forEach(function (step, i) { if (Math.abs(step - z) < Math.abs(STEPS[index] - z)) index = i; });
+    applyZoom(STEPS[Math.max(0, Math.min(STEPS.length - 1, index + direction))]);
+  }
+  if (label) {
+    showZoom(currentZoom());
+    document.getElementById("lr-zoom-in").addEventListener("click", function () { stepZoom(1); });
+    document.getElementById("lr-zoom-out").addEventListener("click", function () { stepZoom(-1); });
+    label.addEventListener("click", function () { applyZoom(1); });
+  }
+
+  // Word wrap (per tab). The CSS reflows by itself when the window is resized.
+  var wrapButton = document.getElementById("lr-wrap");
+  function toggleWrap() {
+    keepPosition(function () {
+      var on = !root.classList.contains("lr-wrap");
+      root.classList.toggle("lr-wrap", on);
+      write("wrap", on ? "1" : "0");
+      if (wrapButton) wrapButton.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  if (wrapButton) {
+    wrapButton.setAttribute("aria-pressed", root.classList.contains("lr-wrap") ? "true" : "false");
+    wrapButton.addEventListener("click", toggleWrap);
+  }
+
+  // Keyboard: + - 0 zoom, w or Alt+Z wrap, t contents box, Esc closes it.
+  document.addEventListener("keydown", function (e) {
+    if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName || "")) return;
+    if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === "KeyZ") {
+      if (wrapButton) { e.preventDefault(); toggleWrap(); }
       return;
     }
-    if (CFG.kind === "json") {
-      try { text = JSON.stringify(JSON.parse(text), null, 2); }
-      catch (e) { note.textContent = "Invalid JSON, showing the file as-is: " + e.message; }
-    } else if (CFG.lang === "javascript" && /[^\\n]{500}/.test(text)) {
-      text = js_beautify(text, { indent_size: 2 });
-      note.textContent = "Minified source detected: beautified for display.";
-    }
-    el.textContent = text;
-    if (CFG.lang && window.hljs) {
-      if (text.length > CFG.highlightLimit) {
-        note.textContent += " Syntax highlighting skipped (large file).";
-      } else if (hljs.getLanguage(CFG.lang)) {
-        el.className = "language-" + CFG.lang;
-        hljs.highlightElement(el);
-      }
-    }
-  } catch (e) {
-    note.textContent = "Preview failed (" + e.message + "). Showing plain text.";
-    el.textContent = text;
-    el.style.whiteSpace = "pre-wrap";
-  }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (label && (e.key === "+" || e.key === "=")) stepZoom(1);
+    else if (label && (e.key === "-" || e.key === "_")) stepZoom(-1);
+    else if (label && e.key === "0") applyZoom(1);
+    else if (wrapButton && e.key === "w") toggleWrap();
+    else if (window.toggleToc && e.key === "t") window.toggleToc();
+    else if (window.toggleToc && e.key === "Escape") window.toggleToc(false);
+  });
 })();
 """
- 
- 
-def page(title, body, head=""):
-    """Wrap body HTML in the shared dark page layout (includes live reload)."""
+
+# Directory listing: sorting and folder sizes.
+LISTING_JS = r"""
+(function () {
+  var list = document.getElementById("lr-listing");
+  var body = document.getElementById("lr-rows");
+  if (!list || !body) return;
+
+  var rows = Array.prototype.slice.call(body.querySelectorAll(".row[data-name]"));
+  var DEFAULT_DIRECTION = { name: "asc", size: "desc", mtime: "desc" };
+  var collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  var state = { key: "name", direction: "asc" };
+
+  try {
+    var saved = (sessionStorage.getItem("lr-sort") || "").split(":");
+    if (DEFAULT_DIRECTION[saved[0]] && (saved[1] === "asc" || saved[1] === "desc")) {
+      state = { key: saved[0], direction: saved[1] };
+    }
+  } catch (e) {}
+
+  function sortRows() {
+    var sign = state.direction === "asc" ? 1 : -1;
+    rows.sort(function (a, b) {
+      if (a.dataset.dir !== b.dataset.dir) return a.dataset.dir === "1" ? -1 : 1;  // folders stay first
+      var result = state.key === "name"
+        ? collator.compare(a.dataset.name, b.dataset.name)
+        : (+a.dataset[state.key]) - (+b.dataset[state.key]);
+      return result ? result * sign : collator.compare(a.dataset.name, b.dataset.name);
+    });
+    var fragment = document.createDocumentFragment();
+    rows.forEach(function (row) { fragment.appendChild(row); });
+    body.appendChild(fragment);
+  }
+
+  function markHeaders() {
+    list.querySelectorAll("[data-key]").forEach(function (button) {
+      var active = button.dataset.key === state.key;
+      button.parentNode.setAttribute("aria-sort",
+        active ? (state.direction === "asc" ? "ascending" : "descending") : "none");
+    });
+  }
+
+  list.querySelector(".lhead").addEventListener("click", function (e) {
+    var button = e.target.closest("[data-key]");
+    if (!button) return;
+    var key = button.dataset.key;
+    state = key === state.key
+      ? { key: key, direction: state.direction === "asc" ? "desc" : "asc" }
+      : { key: key, direction: DEFAULT_DIRECTION[key] };
+    try { sessionStorage.setItem("lr-sort", state.key + ":" + state.direction); } catch (err) {}
+    sortRows();
+    markHeaders();
+  });
+
+  markHeaders();
+  if (state.key !== "name" || state.direction !== "asc") sortRows();
+
+  // Folder sizes arrive one by one (two at a time) so a huge folder never blocks the page.
+  var queue = rows.filter(function (row) { return row.dataset.dir === "1"; });
+  var running = 0, resortTimer = null;
+
+  function resortSoon() {
+    if (state.key !== "size" || resortTimer) return;
+    resortTimer = setTimeout(function () { resortTimer = null; sortRows(); }, 150);
+  }
+
+  function loadSize(row) {
+    var cell = row.querySelector(".size");
+    return fetch("/__size?path=" + encodeURIComponent(location.pathname + row.dataset.href))
+      .then(function (response) { if (!response.ok) throw new Error(); return response.json(); })
+      .then(function (info) {
+        row.dataset.size = info.size;
+        cell.textContent = info.text;
+        if (info.partial) cell.title = "Partial total: counting stopped early because the folder is very large.";
+      })
+      .catch(function () { cell.textContent = "\u2014"; });
+  }
+
+  function pump() {
+    while (running < 2 && queue.length) {
+      running++;
+      loadSize(queue.shift()).then(function () { running--; resortSoon(); pump(); });
+    }
+  }
+  pump();
+})();
+"""
+
+# Runs inside a Web Worker (built from a Blob), so it must stay self-contained.
+# It formats minified JavaScript and highlights code off the main thread.
+PREVIEW_JS = r"""
+function workerMain() {
+  self.window = self;  // some library builds look for `window`
+  self.onmessage = function (event) {
+    var job = event.data;
+    try {
+      var text = job.text;
+      if (job.format) {
+        importScripts(job.libs.beautify);
+        text = self.js_beautify(text, { indent_size: 2 });
+        self.postMessage({ type: "formatted", text: text });
+      }
+      if (job.highlight) {
+        var tooBig = text.length > job.highlightLimit;
+        var longLines = /[^\n]{20000}/.test(text);
+        if (!job.force && (tooBig || longLines)) {
+          self.postMessage({ type: "skipped", reason: tooBig ? "large" : "long" });
+        } else {
+          importScripts(job.libs.hljs);
+          var result = self.hljs.highlight(text, { language: job.lang, ignoreIllegals: true });
+          self.postMessage({ type: "highlighted", html: result.value });
+        }
+      }
+      self.postMessage({ type: "done" });
+    } catch (error) {
+      self.postMessage({ type: "error", message: String((error && error.message) || error) });
+    }
+  };
+}
+
+// Runs in the page: fetches the raw file, renders it, builds the contents box.
+(function () {
+  var el = document.getElementById("lr-content");
+  var note = document.getElementById("lr-note");
+  var noteText = document.getElementById("lr-note-text");
+  var actions = document.getElementById("lr-note-actions");
+  var tocButton = document.getElementById("lr-toc-button");
+  var toc = document.getElementById("lr-toc");
+  var tocList = document.getElementById("lr-toc-list");
+  var headings = [];
+  var active = null;
+  var loading = {};
+  var notes = [];
+  var status = "";
+  var shown = false;
+
+  function refreshNote() {
+    noteText.textContent = notes.concat(status ? [status] : []).join(" ");
+    note.hidden = !noteText.textContent && !actions.firstChild;
+  }
+  function addNote(message) { notes.push(message); refreshNote(); }
+  function setStatus(message) { status = message; refreshNote(); }
+  function finish() { window.restoreScroll(); }
+  function showText(text) {
+    el.textContent = text;
+    if (!shown) { shown = true; finish(); }
+  }
+
+  function load(url) {
+    if (!loading[url]) {
+      loading[url] = new Promise(function (resolve, reject) {
+        var script = document.createElement("script");
+        script.src = url;
+        script.onload = resolve;
+        script.onerror = function () { reject(new Error("could not load a preview library (offline?)")); };
+        document.head.appendChild(script);
+      });
+    }
+    return loading[url];
+  }
+
+  function loadHighlightCss() {
+    if (document.getElementById("lr-hljs-css")) return;
+    var link = document.createElement("link");
+    link.id = "lr-hljs-css";
+    link.rel = "stylesheet";
+    link.href = CFG.libs.hljsCss;
+    document.head.appendChild(link);
+  }
+
+  function loadHighlighter() {
+    loadHighlightCss();
+    return load(CFG.libs.hljs);
+  }
+
+  // ---- background worker ----
+
+  function runWorker(job, onMessage) {
+    var url, worker, finished = false;
+    function stop() {
+      if (finished) return;
+      finished = true;
+      if (worker) worker.terminate();
+      if (url) URL.revokeObjectURL(url);
+    }
+    try {
+      url = URL.createObjectURL(new Blob(["(" + workerMain.toString() + ")()"], { type: "text/javascript" }));
+      worker = new Worker(url);
+    } catch (e) {
+      onMessage({ type: "error", message: "Web Workers are unavailable" });
+      stop();
+      return;
+    }
+    worker.onmessage = function (event) {
+      onMessage(event.data);
+      if (event.data.type === "done" || event.data.type === "error") stop();
+    };
+    worker.onerror = function () {
+      onMessage({ type: "error", message: "the background worker failed" });
+      stop();
+    };
+    worker.postMessage(job);
+  }
+
+  function runJob(job, text) {
+    var current = text;
+    runWorker(job, function (m) {
+      if (m.type === "formatted") {
+        current = m.text;
+        showText(current);
+        addNote("Minified source detected: formatted for reading.");
+        setStatus(job.highlight ? "Highlighting\u2026" : "");
+      } else if (m.type === "highlighted") {
+        el.innerHTML = m.html;
+        el.className = "hljs language-" + job.lang;
+      } else if (m.type === "skipped") {
+        addNote(m.reason === "large"
+          ? "Syntax highlighting skipped (large file)."
+          : "Syntax highlighting skipped (very long lines).");
+        offerHighlight(current);
+      } else if (m.type === "error") {
+        addNote("Could not " + (shown ? "highlight" : "format") + " this file (" + m.message + ").");
+        setStatus("");
+        if (!shown) showText(text);
+      } else if (m.type === "done") {
+        setStatus("");
+      }
+    });
+  }
+
+  function offerHighlight(text) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "linkbtn";
+    button.textContent = "Highlight anyway";
+    button.addEventListener("click", function () {
+      actions.textContent = "";
+      notes = notes.filter(function (n) { return n.indexOf("Syntax highlighting skipped") !== 0; });
+      setStatus("Highlighting\u2026");
+      runJob({ text: text, lang: CFG.lang, highlight: true, force: true,
+               highlightLimit: CFG.highlightLimit, libs: CFG.libs }, text);
+    });
+    actions.appendChild(button);
+    refreshNote();
+  }
+
+  // ---- contents box (Markdown only) ----
+
+  function toggleToc(open) {
+    if (!tocButton || tocButton.hidden) return;
+    if (open === undefined) open = toc.hidden;
+    toc.hidden = !open;
+    tocButton.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) markCurrent();
+  }
+
+  function markCurrent(target) {
+    var current = target || headings[0];
+    if (!target) {
+      for (var i = 0; i < headings.length; i++) {
+        if (headings[i].el.getBoundingClientRect().top > 24) break;
+        current = headings[i];
+      }
+    }
+    if (active) active.classList.remove("on");
+    active = current.link;
+    active.classList.add("on");
+    active.scrollIntoView({ block: "nearest" });
+  }
+
+  function buildToc() {
+    if (!tocButton) return;
+    var found = el.querySelectorAll("h1,h2,h3,h4");
+    if (found.length < 2) return;
+    var base = 6, counts = {}, fragment = document.createDocumentFragment();
+    found.forEach(function (h) { base = Math.min(base, +h.tagName[1]); });
+    found.forEach(function (h, i) {
+      var slug = h.textContent.trim().toLowerCase()
+        .replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s/g, "-") || "section";
+      var n = counts[slug] === undefined ? 0 : counts[slug] + 1;
+      counts[slug] = n;
+      h.id = n ? slug + "-" + n : slug;
+      var link = document.createElement("a");
+      link.href = "#" + h.id;
+      link.textContent = h.textContent.trim();
+      link.dataset.i = i;
+      link.style.paddingLeft = (10 + (+h.tagName[1] - base) * 14) + "px";
+      fragment.appendChild(link);
+      headings.push({ el: h, id: h.id, link: link });
+    });
+    tocList.appendChild(fragment);
+    tocButton.hidden = false;
+  }
+
+  if (tocButton) {
+    window.toggleToc = toggleToc;
+    tocButton.addEventListener("click", function () { toggleToc(); });
+    document.getElementById("lr-toc-close").addEventListener("click", function () { toggleToc(false); });
+    tocList.addEventListener("click", function (e) {
+      var link = e.target.closest("a");
+      if (!link) return;
+      e.preventDefault();
+      var heading = headings[+link.dataset.i];
+      heading.el.scrollIntoView();
+      history.replaceState(null, "", "#" + heading.id);
+      markCurrent(heading);
+    });
+  }
+
+  // ---- renderers ----
+
+  async function renderMarkdown(text) {
+    await Promise.all([load(CFG.libs.marked), load(CFG.libs.purify)]);
+    el.innerHTML = DOMPurify.sanitize(marked.parse(text));
+    buildToc();
+    finish();
+    var blocks = Array.prototype.filter.call(el.querySelectorAll("pre code"), function (block) {
+      return /language-\S+/.test(block.className);
+    });
+    if (!blocks.length) return;
+    try {
+      await loadHighlighter();
+      blocks.forEach(function (block) {
+        var name = /language-(\S+)/.exec(block.className)[1];
+        if (hljs.getLanguage(name)) hljs.highlightElement(block);
+      });
+    } catch (e) { /* highlighting is optional */ }
+  }
+
+  function renderCode(text) {
+    var lang = CFG.lang, format = false;
+    if (CFG.kind === "json") {
+      if (text.length > CFG.formatLimit) {
+        addNote("File too large to pretty-print, showing it as-is.");
+      } else {
+        try { text = JSON.stringify(JSON.parse(text), null, 2); }
+        catch (e) { addNote("Not valid JSON, showing the file as-is."); }
+      }
+    } else if (lang === "javascript" && (CFG.minHint || /[^\n]{500}/.test(text))) {
+      if (text.length > CFG.formatLimit) addNote("Minified file is too large to format here, showing it as-is.");
+      else format = true;
+    }
+    if (!format) showText(text);
+    if (!lang) return;
+    loadHighlightCss();
+    setStatus(format ? "Formatting\u2026" : "Highlighting\u2026");
+    runJob({ text: text, lang: lang, format: format, highlight: true,
+             highlightLimit: CFG.highlightLimit, libs: CFG.libs }, text);
+  }
+
+  (async function () {
+    var text = "";
+    try {
+      var response = await fetch(CFG.rawUrl);
+      if (!response.ok) throw new Error(response.status + " " + response.statusText);
+      text = await response.text();
+      if (CFG.mode === "raw") showText(text);
+      else if (CFG.kind === "markdown") await renderMarkdown(text);
+      else renderCode(text);
+    } catch (e) {
+      addNote("Preview failed (" + e.message + "). Showing the plain text.");
+      el.textContent = text;
+      el.style.whiteSpace = "pre-wrap";
+      finish();
+    }
+  })();
+})();
+"""
+
+
+def page(title, body, dock="", script=""):
+    """Wrap body HTML in the shared dark page layout.
+
+    The dock and page scripts come after the body so they can find every element they use.
+    """
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{html.escape(title)}</title>{head}<style>{CSS}</style></head>"
-        f"<body>{body}{RELOAD_SCRIPT}</body></html>"
+        '<meta name="color-scheme" content="dark">'
+        f"<title>{html.escape(title)}</title>"
+        f"<script>{PAGE_INIT_JS}</script><style>{CSS}</style></head>"
+        f"<body>{body}{dock}<script>{script}</script><script>{PAGE_JS}</script></body></html>"
     )
- 
- 
+
+
+def dock_html(with_wrap=False, with_contents=False):
+    """Floating controls: zoom, optional word wrap, optional contents button and box."""
+    wrap = contents = panel = ""
+    if with_wrap:
+        wrap = (
+            '<button id="lr-wrap" class="round" aria-label="Toggle word wrap" '
+            'title="Toggle word wrap (w or Alt+Z)" aria-pressed="true">'
+            '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" '
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M3 6h18M3 12h14a3 3 0 0 1 0 6h-5M3 18h5"/><path d="m14 15-2 3 2 3"/></svg></button>'
+        )
+    if with_contents:
+        contents = (
+            '<button id="lr-toc-button" class="fab" aria-label="Contents" title="Contents (t)" '
+            'aria-expanded="false" aria-controls="lr-toc" hidden>'
+            '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" '
+            'stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>'
+        )
+        panel = (
+            '<nav id="lr-toc" class="toc" aria-label="Contents" hidden>'
+            '<div class="toc-head"><strong>Contents</strong>'
+            '<button id="lr-toc-close" aria-label="Close contents">&times;</button></div>'
+            '<div id="lr-toc-list" class="toc-list"></div></nav>'
+        )
+    return (
+        '<div class="dock"><div class="zoom">'
+        '<button id="lr-zoom-out" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>'
+        '<button id="lr-zoom-reset" aria-label="Reset zoom" title="Reset zoom (0)">100%</button>'
+        '<button id="lr-zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button></div>'
+        f"{wrap}{contents}</div>{panel}"
+    )
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
- 
+
 def is_inside(path, root):
     """True if path is root or lives below it (both must be real paths)."""
     return os.path.commonpath([root, path]) == root
- 
- 
+
+
 def human_size(size):
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024 or unit == "GB":
             return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
- 
- 
+
+
 def breadcrumbs(root_name, url_path):
     """Clickable path: parents are links, the current item is plain text."""
     parts = [part for part in unquote(url_path).split("/") if part]
-    crumbs = []
+    crumbs = [f'<a href="/">{html.escape(root_name)}</a>' if parts else html.escape(root_name)]
     href = "/"
-    if parts:
-        crumbs.append(f'<a href="/">{html.escape(root_name)}</a>')
-    else:
-        crumbs.append(html.escape(root_name))
     for part in parts[:-1]:
         href += quote(part) + "/"
         crumbs.append(f'<a href="{html.escape(href)}">{html.escape(part)}</a>')
     if parts:
         crumbs.append(html.escape(parts[-1]))
     return '<span class="sep">/</span>'.join(crumbs)
- 
- 
+
+
+def view_toggle(url_path, raw_mode, force):
+    """Preview / Raw switch shown in the header of text files."""
+    current = ' class="on" aria-current="page"'
+    preview_url = url_path + ("?force=1" if force else "")
+    raw_url = url_path + "?view=raw" + ("&force=1" if force else "")
+    return (
+        '<div class="seg">'
+        f'<a href="{html.escape(preview_url)}"{"" if raw_mode else current}>Preview</a>'
+        f'<a href="{html.escape(raw_url)}"{current if raw_mode else ""}>Raw</a></div>'
+    )
+
+
 def is_text_file(path):
     """Cheap check on the first bytes: no NUL bytes and valid UTF-8."""
     try:
@@ -221,15 +796,15 @@ def is_text_file(path):
         return True
     except (OSError, UnicodeDecodeError):
         return False
- 
- 
+
+
 def classify(path, mime):
     """Return (kind, language) where kind is markdown/json/code/image/native/binary."""
     name = os.path.basename(path).lower()
     extension = os.path.splitext(name)[1]
     if extension in (".md", ".markdown"):
         return "markdown", "markdown"
-    if extension == ".json":
+    if extension in JSON_EXTENSIONS:
         return "json", "json"
     if extension in IMAGE_EXTENSIONS:
         return "image", ""
@@ -242,14 +817,14 @@ def classify(path, mime):
     if mime.startswith("text/"):
         return "code", ""  # plain text, no highlighting
     return "binary", ""
- 
- 
+
+
 def with_charset(mime):
     if mime.startswith("text/") or mime in ("application/json", "application/javascript"):
         return mime + "; charset=utf-8"
     return mime
- 
- 
+
+
 def parse_range(header, size):
     """Parse a single 'bytes=a-b' range. Returns (start, end) or None to send the whole file."""
     if not header:
@@ -268,17 +843,17 @@ def parse_range(header, size):
         return start, end
     except ValueError:
         return None
- 
- 
+
+
 def inject_reload(data):
     """Insert the reload script before </body> (or append it)."""
-    snippet = RELOAD_SCRIPT.encode()
+    snippet = INJECTED_RELOAD_SCRIPT.encode()
     index = data.lower().rfind(b"</body>")
     if index == -1:
         return data + snippet
     return data[:index] + snippet + data[index:]
- 
- 
+
+
 def describe_entry(entry, root):
     """Return (is_dir, size, mtime) or None if the entry must be hidden."""
     try:
@@ -288,8 +863,38 @@ def describe_entry(entry, root):
         return stat.S_ISDIR(info.st_mode), info.st_size, info.st_mtime
     except OSError:
         return None  # broken link or unreadable entry
- 
- 
+
+
+def scan_folder_size(path):
+    """Total size of the regular files below path (symlinks are not followed).
+
+    Returns (bytes, complete). complete is False when a limit stopped the count.
+    """
+    total = 0
+    seen = 0
+    deadline = time.monotonic() + FOLDER_SIZE_SECONDS
+    pending = [path]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as iterator:
+                for entry in iterator:
+                    seen += 1
+                    if seen > FOLDER_SIZE_LIMIT or (seen % 1024 == 0 and time.monotonic() > deadline):
+                        return total, False
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue  # unreadable folder: skip it
+    return total, True
+
+
 def render_listing(root, root_name, url_path, entries):
     rows = []
     for entry in entries:
@@ -297,63 +902,73 @@ def render_listing(root, root_name, url_path, entries):
         if details:
             rows.append((entry.name, *details))
     rows.sort(key=lambda row: (not row[1], row[0].lower()))
- 
-    html_rows = []
+
+    items = []
     if url_path != "/":
-        html_rows.append('<tr><td class="name dir"><a href="../">..</a></td>'
-                         '<td class="size"></td><td class="date"></td></tr>')
+        items.append('<div class="row up" role="row"><a class="name" href="../">..</a></div>')
     for name, is_dir, size, mtime in rows:
-        href = quote(name) + ("/" if is_dir else "")
+        href = html.escape(quote(name) + ("/" if is_dir else ""))
         modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-        html_rows.append(
-            f'<tr><td class="name{" dir" if is_dir else ""}"><a href="{href}">{html.escape(name)}</a></td>'
-            f'<td class="size">{"" if is_dir else human_size(size)}</td>'
-            f'<td class="date">{modified}</td></tr>'
+        items.append(
+            '<div class="row" role="row" data-name="%s" data-dir="%d" data-size="%d" data-mtime="%d" '
+            'data-href="%s"><a class="name" href="%s">%s</a><span class="size">%s</span>'
+            '<span class="date">%s</span></div>'
+            % (html.escape(name), is_dir, -1 if is_dir else size, mtime, href, href,
+               html.escape(name), "\u2026" if is_dir else human_size(size), modified)
         )
     if not rows:
-        html_rows.append('<tr><td colspan="3" class="empty">This folder is empty</td></tr>')
- 
+        items.append('<div class="empty">This folder is empty</div>')
+
+    header = (
+        '<div class="lhead" role="row">'
+        '<div class="c-name" role="columnheader" aria-sort="ascending">'
+        '<button type="button" data-key="name">Name<span class="arrow"></span></button></div>'
+        '<div class="c-size" role="columnheader" aria-sort="none">'
+        '<button type="button" data-key="size">Size<span class="arrow"></span></button></div>'
+        '<div class="c-date" role="columnheader" aria-sort="none">'
+        '<button type="button" data-key="mtime">Modified<span class="arrow"></span></button></div></div>'
+    )
     body = (
         f'<header><nav class="crumbs">{breadcrumbs(root_name, url_path)}</nav>'
         f'<span class="meta">{len(rows)} items</span></header>'
-        '<main><table><thead><tr><th>Name</th><th class="size">Size</th><th class="date">Modified</th></tr></thead>'
-        f'<tbody>{"".join(html_rows)}</tbody></table></main>'
+        f'<main><div class="listing" id="lr-listing" role="table" aria-label="Directory listing">'
+        f'{header}<div id="lr-rows">{"".join(items)}</div></div></main>'
     )
-    return page(f"Index of {unquote(url_path)}", body)
- 
- 
+    return page(f"Index of {unquote(url_path)}", body, dock_html(), LISTING_JS)
+
+
 # --------------------------------------------------------------------------
 # Change detection (inotify)
 # --------------------------------------------------------------------------
- 
+
 IN_MODIFY, IN_MOVED_FROM, IN_MOVED_TO = 0x2, 0x40, 0x80
 IN_CREATE, IN_DELETE = 0x100, 0x200
 IN_IGNORED, IN_ISDIR = 0x8000, 0x40000000
 WATCH_MASK = IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
- 
- 
+
+
 class ChangeNotifier:
     """Holds a version number that increases on every file change."""
- 
+
     def __init__(self):
         self.version = int(time.time() * 1000)
         self._condition = threading.Condition()
- 
+
     def bump(self):
         with self._condition:
             self.version += 1
             self._condition.notify_all()
- 
+
     def wait(self, seen_version, timeout):
         """Block until the version differs from seen_version or the timeout passes."""
         with self._condition:
             self._condition.wait_for(lambda: self.version != seen_version, timeout)
             return self.version
- 
- 
+
+
 class DirectoryWatcher(threading.Thread):
     """Recursively watches a directory tree. Sleeps in the kernel until something changes."""
- 
+
     def __init__(self, root, notifier):
         super().__init__(daemon=True)
         libc = ctypes.CDLL(None, use_errno=True)
@@ -367,7 +982,7 @@ class DirectoryWatcher(threading.Thread):
         self._directories = {}  # watch descriptor -> directory path
         self.failed = 0         # directories that could not be watched
         self._watch_tree(root)
- 
+
     def _watch_tree(self, top):
         for dirpath, dirnames, _ in os.walk(top):
             dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRS]
@@ -376,7 +991,7 @@ class DirectoryWatcher(threading.Thread):
                 self._directories[descriptor] = dirpath
             else:
                 self.failed += 1
- 
+
     def _read_events(self):
         data = os.read(self._fd, 65536)
         offset = 0
@@ -389,7 +1004,7 @@ class DirectoryWatcher(threading.Thread):
             elif (mask & IN_ISDIR and mask & (IN_CREATE | IN_MOVED_TO)
                   and name not in IGNORED_DIRS and descriptor in self._directories):
                 self._watch_tree(os.path.join(self._directories[descriptor], name))
- 
+
     def run(self):
         while True:
             self._read_events()
@@ -397,26 +1012,28 @@ class DirectoryWatcher(threading.Thread):
             while select.select([self._fd], [], [], DEBOUNCE_SECONDS)[0]:
                 self._read_events()
             self._notifier.bump()
- 
- 
+
+
 # --------------------------------------------------------------------------
 # HTTP server
 # --------------------------------------------------------------------------
- 
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "live-server"
+    server_version = "livereader"
     sys_version = ""
- 
+
     def log_message(self, format, *args):
         pass  # keep the terminal quiet
- 
+
     # -- routing ----------------------------------------------------------
- 
+
     def do_GET(self):
         url = urlsplit(self.path)
         if url.path == EVENTS_PATH:
             return self.serve_events()
- 
+        if url.path == SIZE_PATH:
+            return self.serve_size(parse_qs(url.query).get("path", [""])[0])
+
         full_path = self.resolve(url.path)
         if full_path is None:
             return self.send_error_page(403, "Forbidden", "That path is outside the served directory.")
@@ -428,12 +1045,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error_page(403, "Forbidden", "Permission denied.")
         except OSError as error:
             return self.send_error_page(500, "Server error", error.strerror or "Unexpected error.")
- 
+
         if stat.S_ISDIR(info.st_mode):
             self.serve_directory(full_path, url)
         else:
             self.serve_file(full_path, url)
- 
+
     def resolve(self, url_path):
         """Map a URL path to a real path inside the root, or None if it escapes the root."""
         relative = unquote(url_path).lstrip("/")
@@ -441,9 +1058,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         full_path = os.path.realpath(os.path.join(self.server.root, relative))
         return full_path if is_inside(full_path, self.server.root) else None
- 
+
     # -- responses --------------------------------------------------------
- 
+
     def send_text(self, status, content, content_type="text/html; charset=utf-8"):
         data = content.encode("utf-8") if isinstance(content, str) else content
         self.send_response(status)
@@ -452,7 +1069,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
- 
+
     def send_error_page(self, status, title, message):
         body = (
             f'<header><nav class="crumbs">{html.escape(self.server.root_name)}</nav></header>'
@@ -460,7 +1077,7 @@ class Handler(BaseHTTPRequestHandler):
             f'<p>{html.escape(message)}</p><a href="/">Back to the root</a></div></main>'
         )
         self.send_text(status, page(f"{status} {title}", body))
- 
+
     def serve_events(self):
         """Server-Sent Events: sends the current version on connect, on change and as heartbeat."""
         self.send_response(200)
@@ -477,7 +1094,17 @@ class Handler(BaseHTTPRequestHandler):
                 version = notifier.wait(version, HEARTBEAT_SECONDS)
         except ConnectionError:
             pass  # browser tab closed
- 
+
+    def serve_size(self, url_path):
+        """JSON with the total size of one folder, for the directory listing."""
+        target = self.resolve(url_path)
+        if target is None or not os.path.isdir(target):
+            return self.send_text(404, "{}", "application/json")
+        size, complete = self.server.folder_size(target)
+        payload = {"size": size, "text": ("" if complete else "\u2265 ") + human_size(size),
+                   "partial": not complete}
+        self.send_text(200, json.dumps(payload), "application/json")
+
     def serve_directory(self, directory, url):
         if not url.path.endswith("/"):  # relative links need the trailing slash
             self.send_response(301)
@@ -497,24 +1124,26 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error_page(500, "Server error", error.strerror or "Unexpected error.")
         listing = render_listing(self.server.root, self.server.root_name, url.path, entries)
         self.send_text(200, listing)
- 
+
     def serve_file(self, path, url):
         mime = mimetypes.guess_type(path)[0]
         if mime is None:
             mime = "text/plain" if is_text_file(path) else "application/octet-stream"
         if mime == "text/html":
             return self.serve_html(path)
- 
-        # Only direct page navigations get the pretty preview. Sub-resource requests
-        # (<script src>, fetch, <img>, ...) and tools like curl receive the raw file.
+
+        # Only page navigations get the reader view. Sub-resource requests
+        # (<script src>, fetch, <img>, ...) and tools like curl receive the raw bytes,
+        # as does any URL with ?raw=1.
+        query = parse_qs(url.query, keep_blank_values=True)
         is_navigation = self.headers.get("Sec-Fetch-Dest") == "document"
-        wants_raw = "raw" in parse_qs(url.query, keep_blank_values=True)
-        if is_navigation and not wants_raw:
+        if is_navigation and "raw" not in query:
             kind, language = classify(path, mime)
             if kind != "native":
-                return self.serve_preview(path, url, kind, language)
+                mode = "raw" if query.get("view") == ["raw"] else "preview"
+                return self.serve_preview(path, url, kind, language, mode, "force" in query)
         self.serve_raw(path, mime)
- 
+
     def serve_html(self, path):
         """HTML files are served as-is with the reload script injected."""
         try:
@@ -527,9 +1156,11 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as error:
             return self.send_error_page(500, "Server error", error.strerror or "Unexpected error.")
         self.send_text(200, inject_reload(data), "text/html; charset=utf-8")
- 
+
     def serve_raw(self, path, mime):
         """Stream a file in chunks, with single-range support for media seeking."""
+        if mime == "text/markdown":
+            mime = "text/plain"  # browsers download text/markdown instead of showing it
         try:
             file = open(path, "rb")
         except PermissionError:
@@ -557,65 +1188,83 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
- 
-    def serve_preview(self, path, url, kind, language):
-        """Dark preview page. The browser fetches and renders the file itself."""
+
+    def serve_preview(self, path, url, kind, language, mode, force):
+        """Reader page. The browser fetches the raw file and renders it itself."""
         try:
             size = os.path.getsize(path)
         except OSError as error:
             return self.send_error_page(500, "Server error", error.strerror or "Unexpected error.")
         name = os.path.basename(path)
-        raw_url = html.escape(url.path + "?raw=1")
-        head = ""
- 
+        raw_url = url.path + "?raw=1"
+        raw_mode = mode == "raw"
+        toggle = ""
+        dock = ""
+        script = ""
+
         if kind == "image":
-            content = f'<div class="image"><img src="{raw_url}" alt="{html.escape(name)}"></div>'
+            content = f'<div class="image"><img src="{html.escape(raw_url)}" alt="{html.escape(name)}"></div>'
         elif kind == "binary":
             content = '<div class="notice">No preview is available for this file type.</div>'
-        elif size > PREVIEW_LIMIT:
-            content = (f'<div class="notice">This file is {human_size(size)}, which is too large '
-                       "to preview. Use the Raw or Download links above.</div>")
+        elif size > PREVIEW_LIMIT and not force:
+            again = url.path + ("?view=raw&force=1" if raw_mode else "?force=1")
+            content = (f'<div class="notice">This file is {human_size(size)}, above the '
+                       f'{human_size(PREVIEW_LIMIT)} render limit. '
+                       f'<a href="{html.escape(again)}">Render anyway</a> (it may be slow) or '
+                       f'<a href="{html.escape(raw_url)}">open the raw file</a>.</div>')
         else:
-            scripts = ""
-            if language:
-                head = f'<link rel="stylesheet" href="{HLJS_CSS}">'
-                scripts += f'<script src="{HLJS_JS}"></script>'
-            if kind == "markdown":
-                scripts += f'<script src="{MARKED_JS}"></script><script src="{PURIFY_JS}"></script>'
-            if language == "javascript":
-                scripts += f'<script src="{BEAUTIFY_JS}"></script>'
-            config = json.dumps({"kind": kind, "lang": language, "rawUrl": url.path + "?raw=1",
-                                 "highlightLimit": HIGHLIGHT_LIMIT}).replace("<", "\\u003c")
-            if kind == "markdown":
-                target = '<article id="content" class="markdown"></article>'
+            if kind != "code" or language:  # plain text looks the same in both views
+                toggle = view_toggle(url.path, raw_mode, force)
+            config = json.dumps({
+                "kind": kind, "lang": language, "mode": mode, "rawUrl": raw_url,
+                "minHint": ".min." in name.lower(),
+                "formatLimit": FORMAT_LIMIT, "highlightLimit": HIGHLIGHT_LIMIT, "libs": LIBS,
+            }).replace("<", "\\u003c")
+            if kind == "markdown" and not raw_mode:
+                target = '<article id="lr-content" class="markdown"></article>'
             else:
-                target = '<pre><code id="content"></code></pre>'
-            content = (f'<div id="note" class="note"></div>{target}{scripts}'
-                       f"<script>const CFG={config};{PREVIEW_JS}</script>")
- 
+                target = '<pre><code id="lr-content"></code></pre>'
+            content = ('<div id="lr-note" class="note" hidden><span id="lr-note-text"></span>'
+                       f'<span id="lr-note-actions"></span></div>{target}')
+            dock = dock_html(with_wrap=True, with_contents=kind == "markdown" and not raw_mode)
+            script = f"const CFG={config};{PREVIEW_JS}"
+
         body = (
             f'<header><nav class="crumbs">{breadcrumbs(self.server.root_name, url.path)}</nav>'
-            f'<span class="meta">{human_size(size)}<a href="{raw_url}">Raw</a>'
-            f'<a href="{raw_url}" download>Download</a></span></header>'
+            f'<div class="meta"><span>{human_size(size)}</span>{toggle}</div></header>'
             f"<main>{content}</main>"
         )
-        self.send_text(200, page(name, body, head))
- 
- 
+        self.send_text(200, page(name, body, dock, script))
+
+
 class LiveServer(ThreadingHTTPServer):
     daemon_threads = True  # open event streams must not block shutdown
- 
+
     def __init__(self, address, root):
         super().__init__(address, Handler)  # binding here is the real availability check
         self.root = root
         self.root_name = os.path.basename(root) or "/"
         self.notifier = ChangeNotifier()
- 
+        self._size_cache = {}  # folder -> (change version, time, size, complete)
+
+    def folder_size(self, path):
+        """Cached folder size. An entry is reused until files change or it gets old."""
+        now = time.monotonic()
+        version = self.notifier.version
+        cached = self._size_cache.get(path)
+        if cached and cached[0] == version and now - cached[1] < SIZE_CACHE_SECONDS:
+            return cached[2], cached[3]
+        size, complete = scan_folder_size(path)
+        if len(self._size_cache) > 1000:
+            self._size_cache.clear()
+        self._size_cache[path] = (version, now, size, complete)
+        return size, complete
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):  # ignore closed tabs
             super().handle_error(request, client_address)
- 
- 
+
+
 def create_server(root):
     """Bind to a random free port; fall back to an OS-assigned port."""
     candidates = random.sample(range(*PORT_RANGE), PORT_ATTEMPTS) + [0]
@@ -626,27 +1275,28 @@ def create_server(root):
             if error.errno != errno.EADDRINUSE:
                 raise
     raise OSError("could not find a free port")
- 
- 
+
+
 def main():
     parser = argparse.ArgumentParser(
-        prog="live-server",
-        description="Serve a directory with a file browser, previews and automatic reload.")
+        prog="livereader",
+        description="Read files in your browser: file browser, clean previews and automatic reload.")
     parser.add_argument("directory", nargs="?", default=".",
                         help="directory to serve (default: current directory)")
+    parser.add_argument("-V", "--version", action="version", version=f"livereader {__version__}")
     args = parser.parse_args()
- 
+
     root = os.path.realpath(os.path.expanduser(args.directory))
     if not os.path.isdir(root):
-        sys.exit(f"live-server: not a directory: {args.directory}")
+        sys.exit(f"livereader: not a directory: {args.directory}")
     if not os.access(root, os.R_OK | os.X_OK):
-        sys.exit(f"live-server: permission denied: {args.directory}")
- 
+        sys.exit(f"livereader: permission denied: {args.directory}")
+
     try:
         server = create_server(root)
     except OSError as error:
-        sys.exit(f"live-server: cannot start server: {error}")
- 
+        sys.exit(f"livereader: cannot start server: {error}")
+
     try:
         watcher = DirectoryWatcher(root, server.notifier)
         watcher.start()
@@ -655,7 +1305,7 @@ def main():
                   "(inotify watch limit?)", file=sys.stderr)
     except (OSError, AttributeError) as error:
         print(f"warning: automatic reload disabled ({error})", file=sys.stderr)
- 
+
     host, port = server.server_address[:2]
     print(f"Serving  {root}")
     print(f"Local    http://{host}:{port}/")
@@ -666,7 +1316,7 @@ def main():
         print("\nStopped.")
     finally:
         server.server_close()
- 
- 
+
+
 if __name__ == "__main__":
     main()
